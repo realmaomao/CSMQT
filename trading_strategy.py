@@ -1,336 +1,171 @@
 import pandas as pd
 import numpy as np
+from typing import List, Dict, Any
 import logging
-import matplotlib
-matplotlib.use('TkAgg')  # 显式设置后端
-import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
-from matplotlib.dates import DateFormatter
-from config import CONFIG
-import datetime
-import os
 from pathlib import Path
+import os
+from strategies.base_strategy import BaseStrategy
+from strategies.ma_crossover_strategy import MACrossoverStrategy
+from strategies.rsi_strategy import RSIStrategy
+from strategies.macd_strategy import MACDStrategy
+from strategies.bollinger_strategy import BollingerStrategy
+import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from datetime import datetime
 from data_retrieval import retrieve_stock_data
+from config import CONFIG  # 导入CONFIG
 
 # 创建必要的目录
 os.makedirs('logs', exist_ok=True)
 os.makedirs('plots', exist_ok=True)
 
-# 设置中文字体
-plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
-plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
-
-# Configure logging
-logging.basicConfig(filename='logs/trading_strategy.log', level=logging.INFO, 
-                    format='%(asctime)s - %(levelname)s: %(message)s')
+# 配置日志
+logging.basicConfig(
+    filename='logs/trading_strategy.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s: %(message)s'
+)
 
 class TradingStrategy:
-    def __init__(self, initial_capital=CONFIG['INITIAL_CAPITAL']):
-        """
-        Initialize trading strategy
-        
-        Args:
-            initial_capital (float): Starting trading capital
-        """
-        self.capital = initial_capital
-        self.positions = {}
-        self.trade_history = []
+    """Main trading strategy class that combines multiple sub-strategies"""
     
-    def calculate_macd(self, data):
-        """计算MACD指标"""
-        exp1 = data['close'].ewm(span=CONFIG['MACD_FAST'], adjust=False).mean()
-        exp2 = data['close'].ewm(span=CONFIG['MACD_SLOW'], adjust=False).mean()
-        macd = exp1 - exp2
-        signal = macd.ewm(span=CONFIG['MACD_SIGNAL'], adjust=False).mean()
-        return macd, signal
-    
-    def calculate_bollinger_bands(self, data, window=None, num_std=None):
-        """计算布林带"""
-        window = window or CONFIG['BB_PERIOD']
-        num_std = num_std or CONFIG['BB_STD']
-        sma = data['close'].rolling(window=window).mean()
-        std = data['close'].rolling(window=window).std()
-        upper_band = sma + (std * num_std)
-        lower_band = sma - (std * num_std)
-        return upper_band, lower_band
-    
-    def moving_average_crossover(self, data):
-        """
-        Enhanced Moving Average Crossover Strategy
-        """
-        if f'MA{CONFIG["MA_FAST"]}' not in data.columns or f'MA{CONFIG["MA_SLOW"]}' not in data.columns:
-            return 'hold'
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.strategies: List[BaseStrategy] = [
+            MACrossoverStrategy(config),
+            RSIStrategy(config),
+            MACDStrategy(config),
+            BollingerStrategy(config)
+        ]
+        self.current_position = 0
+        self.entry_price = 0
+        self.high_since_entry = 0
         
-        # 获取最近的MA值
-        ma_fast = data[f'MA{CONFIG["MA_FAST"]}'].iloc[-3:]
-        ma_slow = data[f'MA{CONFIG["MA_SLOW"]}'].iloc[-3:]
-        close_price = data['close'].iloc[-1]
-        
-        # 计算MA的斜率
-        ma_fast_slope = (ma_fast.iloc[-1] - ma_fast.iloc[0]) / 2
-        ma_slow_slope = (ma_slow.iloc[-1] - ma_slow.iloc[0]) / 2
-        
-        # 判断趋势强度
-        trend_strength = abs(ma_fast_slope) > abs(ma_slow_slope) * 1.2  # 降低趋势强度要求
-        
-        # 交叉信号
-        if ma_fast.iloc[-1] > ma_slow.iloc[-1] and \
-           ma_fast.iloc[-2] <= ma_slow.iloc[-2] and \
-           (trend_strength or ma_fast_slope > 0):  # 放宽条件
-            return 'buy'
-        elif ma_fast.iloc[-1] < ma_slow.iloc[-1] and \
-             ma_fast.iloc[-2] >= ma_slow.iloc[-2] and \
-             (trend_strength or ma_fast_slope < 0):  # 放宽条件
-            return 'sell'
-        
-        return 'hold'
-    
-    def rsi_strategy(self, data):
-        """
-        Enhanced RSI Strategy with trend confirmation
-        """
-        if 'RSI' not in data.columns:
-            return 'hold'
-        
-        # 获取最近的RSI值和收盘价
-        rsi_values = data['RSI'].iloc[-5:]
-        close_prices = data['close'].iloc[-5:]
-        
-        # 计算RSI和价格趋势
-        rsi_trend = (rsi_values.iloc[-1] - rsi_values.iloc[0]) / 4
-        price_trend = (close_prices.iloc[-1] - close_prices.iloc[0]) / close_prices.iloc[0]
-        
-        current_rsi = rsi_values.iloc[-1]
-        
-        # RSI超卖且趋势向上
-        if current_rsi < CONFIG['RSI_OVERSOLD'] and (rsi_trend > 0 or price_trend > -0.01):  # 放宽价格趋势要求
-            return 'buy'
-        # RSI超买且趋势向下
-        elif current_rsi > CONFIG['RSI_OVERBOUGHT'] and (rsi_trend < 0 or price_trend < 0.01):  # 放宽价格趋势要求
-            return 'sell'
-        
-        return 'hold'
-    
-    def macd_strategy(self, data):
-        """
-        MACD Strategy
-        """
-        macd, signal = self.calculate_macd(data)
-        
-        # 获取最近的MACD值
-        macd_values = macd.iloc[-3:]
-        signal_values = signal.iloc[-3:]
-        
-        # MACD金叉
-        if macd_values.iloc[-1] > signal_values.iloc[-1] and \
-           macd_values.iloc[-2] <= signal_values.iloc[-2] and \
-           macd_values.iloc[-1] > macd_values.iloc[-2]:
-            return 'buy'
-        # MACD死叉
-        elif macd_values.iloc[-1] < signal_values.iloc[-1] and \
-             macd_values.iloc[-2] >= signal_values.iloc[-2] and \
-             macd_values.iloc[-1] < macd_values.iloc[-2]:
-            return 'sell'
-        
-        return 'hold'
-    
-    def bollinger_strategy(self, data):
-        """
-        布林带策略
-        """
-        upper_band, lower_band = self.calculate_bollinger_bands(data)
-        
-        if len(data) < CONFIG['BB_PERIOD']:
-            return 'hold'
-        
-        close_price = data['close'].iloc[-1]
-        
-        # 价格突破下轨且RSI超卖
-        if close_price < lower_band.iloc[-1] and \
-           data['RSI'].iloc[-1] < CONFIG['RSI_OVERSOLD']:
-            return 'buy'
-        # 价格突破上轨且RSI超买
-        elif close_price > upper_band.iloc[-1] and \
-             data['RSI'].iloc[-1] > CONFIG['RSI_OVERBOUGHT']:
-            return 'sell'
-        
-        return 'hold'
-    
-    def fear_greed_strategy(self, data):
-        """
-        基于贪婪恐慌指数的交易策略
-        """
-        if 'Fear_Greed' not in data.columns:
-            return 'hold'
-        
-        fear_greed = data['Fear_Greed'].iloc[-1]
-        fear_greed_ma = data['Fear_Greed'].rolling(window=5).mean().iloc[-1]
-        
-        # 获取趋势
-        fear_greed_trend = data['Fear_Greed'].iloc[-5:].diff().mean()
-        
-        # 极度恐慌时买入（贪婪指数 < 20 且呈上升趋势）
-        if fear_greed < 20 and fear_greed > fear_greed_ma and fear_greed_trend > 0:
-            return 'buy'
-        
-        # 极度贪婪时卖出（贪婪指数 > 80 且呈下降趋势）
-        elif fear_greed > 80 and fear_greed < fear_greed_ma and fear_greed_trend < 0:
-            return 'sell'
-        
-        return 'hold'
-    
-    def combined_strategy(self, data):
-        """
-        Enhanced Combined Strategy with multiple indicators
-        """
-        if len(data) < 30:
-            return 'hold'
-        
-        # 获取各个策略的信号
-        ma_signal = self.moving_average_crossover(data)
-        rsi_signal = self.rsi_strategy(data)
-        macd_signal = self.macd_strategy(data)
-        bb_signal = self.bollinger_strategy(data)
-        fg_signal = self.fear_greed_strategy(data)
-        
-        # 记录各个指标的信号
-        logging.info(f"\n当前信号状态：")
-        logging.info(f"MA信号: {ma_signal}")
-        logging.info(f"RSI信号: {rsi_signal}")
-        logging.info(f"MACD信号: {macd_signal}")
-        logging.info(f"布林带信号: {bb_signal}")
-        logging.info(f"恐慌指数信号: {fg_signal}")
-        
-        # 计算市场趋势
-        ma_fast = data[f'MA{CONFIG["MA_FAST"]}'].iloc[-1]
-        ma_slow = data[f'MA{CONFIG["MA_SLOW"]}'].iloc[-1]
-        trend = 'up' if ma_fast > ma_slow else 'down'
-        logging.info(f"市场趋势: {trend}")
-        
-        # 统计买入和卖出信号
-        signals = [ma_signal, rsi_signal, macd_signal, bb_signal, fg_signal]
-        buy_signals = sum(1 for signal in signals if signal == 'buy')
-        sell_signals = sum(1 for signal in signals if signal == 'sell')
-        
-        # 计算贪婪恐慌指数的权重
-        fear_greed = data['Fear_Greed'].iloc[-1]
-        logging.info(f"恐慌指数: {fear_greed:.2f}")
-        
-        if fear_greed < 20:  # 极度恐慌时增加买入倾向
-            buy_signals += 1
-            logging.info("恐慌指数低于20，增加买入信号")
-        elif fear_greed > 80:  # 极度贪婪时增加卖出倾向
-            sell_signals += 1
-            logging.info("恐慌指数高于80，增加卖出信号")
-        
-        logging.info(f"买入信号数: {buy_signals}, 卖出信号数: {sell_signals}")
-        
-        # 交易信号确认条件
-        # 放宽条件：只需要1个以上的信号，且没有相反信号即可
-        if buy_signals >= 1 and sell_signals == 0:
-            logging.info("生成买入信号")
-            return 'buy'
-        elif sell_signals >= 1 and buy_signals == 0:
-            logging.info("生成卖出信号")
-            return 'sell'
-        
-        logging.info("保持观望")
-        return 'hold'
-    
-    def calculate_position_size(self, stock_price):
-        """
-        Enhanced position size calculation with risk management
-        """
-        # 设置每笔交易的最大风险比例（占总资本的百分比）
-        max_risk_per_trade = 0.02  # 2%
-        
-        # 计算可用于该笔交易的最大资金
-        max_trade_capital = self.capital * 0.1  # 最多使用10%资金
-        
-        # 计算基于风险的头寸规模
-        risk_based_position = (self.capital * max_risk_per_trade) / (stock_price * 0.1)  # 假设止损设在10%
-        
-        # 计算基于资金的头寸规模
-        capital_based_position = max_trade_capital / stock_price
-        
-        # 取两者的较小值
-        position_size = min(int(risk_based_position), int(capital_based_position))
-        
-        return max(0, position_size)  # 确保不返回负数
-    
-    def execute_trade(self, stock_code, data):
-        """
-        Execute trading logic for a single stock
-        
-        Args:
-            stock_code (str): Stock identifier
-            data (pd.DataFrame): Stock price data
-        """
-        try:
-            # 检查是否有足够的历史数据来计算指标
-            if len(data) < 30:  # 至少需要30天数据
-                return
+    def generate_signals(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Generate signals from all strategies"""
+        for strategy in self.strategies:
+            data = strategy.generate_signals(data)
             
-            # 获取当前持仓情况
-            current_position = self.positions.get(stock_code, None)
-            current_price = data['close'].iloc[-1]
+        # Combine signals (require majority agreement)
+        signal_columns = [col for col in data.columns if col.endswith('_Signal')]
+        data['Combined_Signal'] = data[signal_columns].sum(axis=1)
+        data['Trade_Signal'] = 0
+        
+        # Generate trade signals when majority of strategies agree
+        min_agreement = len(self.strategies) // 2 + 1
+        data.loc[data['Combined_Signal'] >= min_agreement, 'Trade_Signal'] = 1
+        data.loc[data['Combined_Signal'] <= -min_agreement, 'Trade_Signal'] = -1
+        
+        return data
+        
+    def should_enter_trade(self, data: pd.DataFrame, index: int) -> bool:
+        """Check if we should enter a trade based on all strategies"""
+        if self.current_position != 0:
+            return False
             
-            # 计算止损价格（如果有持仓）
-            if current_position:
-                stop_loss_price = current_position['entry_price'] * (1 - CONFIG['STOP_LOSS_PCT'])
-                # 检查是否触发止损
-                if current_price <= stop_loss_price:
-                    # 执行止损
-                    sell_value = current_position['shares'] * current_price
-                    self.capital += sell_value
-                    del self.positions[stock_code]
-                    logging.info(f"止损: 卖出 {stock_code}, 价格 {current_price}, 止损价 {stop_loss_price}")
-                    return
-            
-            # 获取交易信号
-            signal = self.combined_strategy(data)
-            
-            # 计算持仓总价值
-            total_value = self.capital
-            for pos in self.positions.values():
-                total_value += pos['shares'] * current_price
-            
-            if signal == 'buy' and len(self.positions) < CONFIG['MAX_POSITIONS']:
-                # 确保没有过度集中
-                if current_position is None:  # 只在没有持仓时买入
-                    # 计算可用资金，考虑风险管理
-                    available_capital = min(
-                        self.capital,
-                        total_value * CONFIG['POSITION_SIZE_PCT']
-                    )
-                    
-                    if available_capital > 1000:  # 确保有足够资金进行有意义的交易
-                        shares = int(available_capital / current_price)
-                        trade_cost = shares * current_price
-                        
-                        if trade_cost <= self.capital:
-                            self.positions[stock_code] = {
-                                'shares': shares,
-                                'entry_price': current_price
-                            }
-                            self.capital -= trade_cost
-                            logging.info(f"买入 {shares} 股 {stock_code}，价格 {current_price}")
-            
-            elif signal == 'sell' and stock_code in self.positions:
-                position = self.positions[stock_code]
-                sell_value = position['shares'] * current_price
-                profit = sell_value - (position['shares'] * position['entry_price'])
-                profit_pct = (profit / (position['shares'] * position['entry_price'])) * 100
+        # Count strategies suggesting entry
+        entry_votes = 0
+        for strategy in self.strategies:
+            should_enter, _ = strategy.should_enter_trade(data, index)
+            if should_enter:
+                entry_votes += 1
                 
-                self.capital += sell_value
-                del self.positions[stock_code]
-                
-                logging.info(f"卖出 {position['shares']} 股 {stock_code}，价格 {current_price}，"
-                           f"收益率 {profit_pct:.2f}%")
+        # Enter if majority of strategies agree
+        return entry_votes >= len(self.strategies) // 2 + 1
         
-        except Exception as e:
-            logging.error(f"交易执行错误 - 股票 {stock_code}：{e}")
+    def should_exit_trade(self, data: pd.DataFrame, index: int) -> bool:
+        """Check if we should exit based on any strategy"""
+        if self.current_position == 0:
+            return False
+            
+        # Exit if any strategy suggests exit
+        for strategy in self.strategies:
+            if strategy.should_exit_trade(data, index, self.entry_price):
+                return True
+                
+        return False
+        
+    def calculate_position_size(self, portfolio_value: float, price: float) -> float:
+        """Calculate position size based on portfolio value"""
+        position_pct = self.config.get('POSITION_SIZE_PCT', 0.1)
+        return (portfolio_value * position_pct) / price
+        
+    def execute_trade(self, data: pd.DataFrame, index: int, portfolio: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute trading decision"""
+        current_price = data.iloc[index]['close']
+        
+        # Update high since entry if in position
+        if self.current_position > 0:
+            self.high_since_entry = max(self.high_since_entry, current_price)
+            
+        # Check exit conditions
+        if self.current_position != 0 and self.should_exit_trade(data, index):
+            # Calculate profit/loss
+            pnl = (current_price - self.entry_price) * self.current_position
+            portfolio['cash'] += current_price * self.current_position + pnl
+            
+            logging.info(f"Exiting position at {current_price:.2f}, PnL: {pnl:.2f}")
+            
+            self.current_position = 0
+            self.entry_price = 0
+            self.high_since_entry = 0
+            
+        # Check entry conditions
+        elif self.current_position == 0 and self.should_enter_trade(data, index):
+            # Calculate position size
+            position_size = self.calculate_position_size(
+                portfolio['cash'],
+                current_price
+            )
+            
+            # Enter position
+            cost = position_size * current_price
+            if cost <= portfolio['cash']:
+                self.current_position = position_size
+                self.entry_price = current_price
+                self.high_since_entry = current_price
+                portfolio['cash'] -= cost
+                
+                logging.info(f"Entering position at {current_price:.2f}, Size: {position_size:.0f}")
+                
+        # Update portfolio value
+        portfolio['value'] = portfolio['cash'] + (self.current_position * current_price)
+        
+        return portfolio
+        
+    def backtest_strategy(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Run backtest on historical data"""
+        # Initialize portfolio
+        portfolio = {
+            'cash': self.config['INITIAL_CAPITAL'],
+            'value': self.config['INITIAL_CAPITAL']
+        }
+        
+        # Generate signals
+        data = self.generate_signals(data)
+        
+        # Initialize results storage
+        results = []
+        
+        # Run through each day
+        for i in range(len(data)):
+            # Execute trading logic
+            portfolio = self.execute_trade(data, i, portfolio)
+            
+            # Store results
+            results.append({
+                'date': data.index[i],
+                'close': data.iloc[i]['close'],
+                'position': self.current_position,
+                'portfolio_value': portfolio['value'],
+                'cash': portfolio['cash']
+            })
+            
+        # Convert results to DataFrame
+        results_df = pd.DataFrame(results)
+        results_df.set_index('date', inplace=True)
+        
+        return results_df
 
 def print_performance_summary(portfolio_values, total_trades, winning_trades, trades):
     """打印策略表现总结"""
@@ -410,19 +245,15 @@ def backtest_strategy():
     执行回测策略
     """
     try:
-        # 创建保存图表的目录
-        plots_dir = Path('plots')
-        plots_dir.mkdir(exist_ok=True)
-        
         # 获取股票数据
         stock_data = {}
         for symbol in CONFIG['STOCK_UNIVERSE']:
             try:
-                data = retrieve_stock_data(symbol, CONFIG['START_DATE'], CONFIG['END_DATE'])
+                data = retrieve_stock_data(symbol, CONFIG['START_DATE'], CONFIG['END_DATE'])  # 调用retrieve_stock_data函数
                 if not data.empty:
                     stock_data[symbol] = data
                     # 生成单个ETF的技术分析图表
-                    plot_single_etf_metrics(symbol, data, None, plots_dir)
+                    plot_single_etf_metrics(symbol, data, None, 'plots')
             except Exception as e:
                 logging.error(f"获取{symbol}数据时出错: {e}")
         
@@ -446,7 +277,7 @@ def backtest_strategy():
         dates = [results.index[0]]  # 记录日期
         
         # 创建交易策略实例
-        strategy = TradingStrategy(initial_capital=current_capital)
+        strategy = TradingStrategy(CONFIG)
         
         for date in results.index[1:]:
             # 对每个股票执行交易策略
@@ -456,15 +287,14 @@ def backtest_strategy():
                     hist_data = stock_data[symbol].loc[:date]
                     if not hist_data.empty:
                         # 执行交易策略
-                        strategy.execute_trade(symbol, hist_data)
+                        portfolio = {
+                            'cash': current_capital,
+                            'value': current_capital
+                        }
+                        portfolio = strategy.execute_trade(hist_data, -1, portfolio)
             
             # 更新持仓价值
-            portfolio_value = strategy.capital  # 现金部分
-            for symbol, position in strategy.positions.items():
-                if symbol in stock_data and date in stock_data[symbol].index:
-                    current_price = stock_data[symbol].loc[date, 'close']
-                    portfolio_value += position['shares'] * current_price
-            
+            portfolio_value = portfolio['value']  # 现金部分
             portfolio_values.append(portfolio_value)
             dates.append(date)
             
@@ -474,9 +304,9 @@ def backtest_strategy():
             # 计算持仓比例
             total_value = portfolio_value
             for symbol in CONFIG['STOCK_UNIVERSE']:
-                if symbol in strategy.positions:
+                if symbol in positions:
                     if symbol in stock_data and date in stock_data[symbol].index:
-                        position_value = strategy.positions[symbol]['shares'] * stock_data[symbol].loc[date, 'close']
+                        position_value = positions[symbol]['shares'] * stock_data[symbol].loc[date, 'close']
                         results.loc[date, f'position_{symbol}'] = position_value / total_value
                 else:
                     results.loc[date, f'position_{symbol}'] = 0.0
@@ -487,7 +317,7 @@ def backtest_strategy():
             results.loc[date, 'drawdown'] = drawdown
         
         # 生成投资组合相关的图表
-        plot_portfolio_metrics(results, str(plots_dir))
+        plot_portfolio_metrics(results, 'plots')
         
         # 打印最终结果
         final_value = portfolio_values[-1]
